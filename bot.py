@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Токен берётся из переменной окружения Render
-TOKEN = os.environ.get("BOT_TOKEN")
+TOKEN = os.environ.get("8774127419:AAFifgwCrQGtqIjAKm8yvrsqYXhC1uPHy0c")
 if not TOKEN:
     raise ValueError("Не установлен BOT_TOKEN!")
 
