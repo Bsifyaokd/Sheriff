@@ -63,7 +63,7 @@ class DuelSession:
     distance: int = 10
     players: Dict[int, PlayerState] = field(default_factory=dict)
     timer_task: Optional[asyncio.Task] = None
-    current_turn_msg_id: Optional[int] = None   # id сообщения с кнопками хода
+    current_turn_msg_id: Optional[int] = None
 
     def opponent(self, user_id: int) -> int:
         return self.challenger_id if user_id == self.target_id else self.target_id
@@ -115,7 +115,6 @@ def build_action_keyboard(duel: DuelSession) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 async def send_turn_message(duel: DuelSession):
-    """Отправляет сообщение с кнопками для текущего игрока, запускает таймер хода."""
     try:
         user = await bot.get_chat(duel.current_turn)
         name = user.full_name
@@ -136,25 +135,19 @@ async def send_turn_message(duel: DuelSession):
     )
     duel.current_turn_msg_id = sent_msg.message_id
 
-    # Отменяем старый таймер, если есть
     if duel.timer_task:
         duel.timer_task.cancel()
-    # Создаём задачу авто-пропуска хода через 2 минуты
     duel.timer_task = asyncio.create_task(auto_skip_turn(duel))
 
 async def auto_skip_turn(duel: DuelSession):
-    """Ждёт 120 секунд, затем передаёт ход противнику."""
     await asyncio.sleep(120)
-    # Если дуэль всё ещё активна и ход всё ещё у того же игрока
     if duel.duel_id in active_duels and duel.current_turn_msg_id is not None:
         try:
-            # Убираем кнопки у сообщения хода
             await bot.edit_message_reply_markup(
                 chat_id=duel.chat_id,
                 message_id=duel.current_turn_msg_id,
                 reply_markup=None
             )
-            # Добавляем текст о пропуске
             user = await bot.get_chat(duel.current_turn)
             name = user.full_name if user else "Игрок"
             await bot.send_message(
@@ -164,9 +157,7 @@ async def auto_skip_turn(duel: DuelSession):
         except Exception as e:
             logger.warning(f"Ошибка при пропуске хода: {e}")
 
-        # Передаём ход
         duel.current_turn = duel.opponent(duel.current_turn)
-        # Отправляем новое сообщение хода
         await send_turn_message(duel)
 
 async def cleanup_duel(duel_id: str):
@@ -198,12 +189,10 @@ async def on_my_chat_member(update: ChatMemberUpdated):
 async def start_cmd(message: Message):
     await message.answer("🤠 Этот бот для дуэлей в группе. Добавьте его в чат и вызовите на дуэль по @username.")
 
-# Простой отклик на слово "Бот" (только в группах)
 @router.message(F.text.lower() == "бот", ~F.from_user.is_bot, F.chat.type.in_({"group", "supergroup"}))
 async def bot_echo(message: Message):
     await message.reply("Я")
 
-# Текстовые команды (подсказки)
 @router.message(F.text.lower().startswith("дуэль да"), F.chat.type.in_({"group", "supergroup"}))
 async def duel_yes_text(message: Message):
     await message.reply("Чтобы принять дуэль, нажмите кнопку под вызовом.")
@@ -216,98 +205,11 @@ async def duel_no_text(message: Message):
 async def duel_cancel_text(message: Message):
     await message.reply("Отменить дуэль можно кнопкой или командой /cancel в личных сообщениях (пока недоступно).")
 
-# Основной вызов
+# Основной вызов (reply + text_mention + @username)
 @router.message(F.text.lower().startswith("дуэль"), F.chat.type.in_({"group", "supergroup"}))
 async def duel_command(message: Message):
     try:
-        # 1. Ответ на сообщение
-        if message.reply_to_message:
-            target_user = message.reply_to_message.from_user
-            if target_user.is_bot:
-                await message.reply("Нельзя вызвать бота на дуэль.")
-                return
-            if target_user.id == message.from_user.id:
-                await message.reply("Нельзя вызвать на дуэль самого себя.")
-                return
-
-            key_challenger = (message.chat.id, message.from_user.id)
-            key_target = (message.chat.id, target_user.id)
-            if key_challenger in occupied or key_target in occupied:
-                await message.reply("Один из участников уже участвует в другой дуэли.")
-                return
-
-            duel_id = uuid.uuid4().hex[:12]
-            duel = DuelSession(
-                duel_id=duel_id,
-                chat_id=message.chat.id,
-                challenger_id=message.from_user.id,
-                target_id=target_user.id,
-                current_turn=0,
-                players={
-                    message.from_user.id: PlayerState(),
-                    target_user.id: PlayerState(),
-                }
-            )
-            active_duels[duel_id] = duel
-            occupied[key_challenger] = duel_id
-            occupied[key_target] = duel_id
-
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{duel_id}"),
-                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decline_{duel_id}"),
-                ]
-            ])
-            inv_msg = await message.answer(
-                f"🔫 {message.from_user.full_name}, минуточку внимания!\n"
-                f"{target_user.full_name} вызывает Вас на дуэль\n"
-                f"💬 Чтобы принять вызов, нажмите «Принять» или «Отклонить»\n"
-                f"На принятие решения у вас есть 5 минут.",
-                reply_markup=kb
-            )
-
-            # Таймер авто-отмены
-            async def auto_cancel():
-                await asyncio.sleep(300)  # 5 минут
-                if duel_id in active_duels:
-                    try:
-                        await inv_msg.edit_text("⏰ Время вышло, вызов отменён.", reply_markup=None)
-                    except:
-                        pass
-                    await cleanup_duel(duel_id)
-
-            asyncio.create_task(auto_cancel())
-            return
-
-        # 2. Вызов по @username (запасной)
-        parts = message.text.split()
-        if len(parts) < 2:
-            await message.reply(
-                "Чтобы вызвать на дуэль, ответьте на сообщение игрока командой «Дуэль».\n"
-                "Или укажите @username: Дуэль @username"
-            )
-            return
-
-        target_username = parts[1]
-        if not target_username.startswith("@"):
-            await message.reply("Используйте @username или ответьте на сообщение.")
-            return
-        target_username = target_username.lstrip("@")
-
-        try:
-            target_user = await bot.get_chat(f"@{target_username}")
-        except:
-            await message.reply("Не удалось найти игрока. Попробуйте вызвать через ответ на его сообщение.")
-            return
-
-        if target_user.id == message.from_user.id:
-            await message.reply("Нельзя вызвать на дуэль самого себя.")
-            return
-
-@router.message(F.text.lower().startswith("дуэль"), F.chat.type.in_({"group", "supergroup"}))
-async def duel_command(message: Message):
-    try:
-        # ----- 1. Обработка ответа на сообщение (reply) -----
+        # ----- 1. Ответ на сообщение (reply) -----
         if message.reply_to_message:
             target_user = message.reply_to_message.from_user
             if target_user.is_bot:
@@ -353,7 +255,7 @@ async def duel_command(message: Message):
             )
 
             async def auto_cancel():
-                await asyncio.sleep(300)  # 5 минут
+                await asyncio.sleep(300)
                 if duel_id in active_duels:
                     try:
                         await inv_msg.edit_text("⏰ Время вышло, вызов отменён.", reply_markup=None)
@@ -364,17 +266,14 @@ async def duel_command(message: Message):
             asyncio.create_task(auto_cancel())
             return
 
-        # ----- 2. Вызов по @username или text_mention -----
+        # ----- 2. Упоминание с ID (text_mention) -----
         target_user = None
-
-        # Ищем text_mention (упоминание с ID — когда пользователь выбран из списка)
         if message.entities:
             for entity in message.entities:
                 if entity.type == "text_mention" and entity.user:
                     target_user = entity.user
                     break
 
-        # Если text_mention найден, используем его
         if target_user:
             if target_user.is_bot:
                 await message.reply("Нельзя вызвать бота на дуэль.")
@@ -430,7 +329,7 @@ async def duel_command(message: Message):
             asyncio.create_task(auto_cancel())
             return
 
-        # ----- 3. Старый вызов по @username (когда нет text_mention) -----
+        # ----- 3. Вызов по @username (запасной) -----
         parts = message.text.split()
         if len(parts) < 2:
             await message.reply(
@@ -445,7 +344,6 @@ async def duel_command(message: Message):
             return
         target_username = target_username.lstrip("@")
 
-        # Пытаемся получить пользователя через get_chat (может не сработать)
         try:
             target_chat = await bot.get_chat(f"@{target_username}")
             target_id = target_chat.id
@@ -536,13 +434,11 @@ async def process_invite(callback: CallbackQuery):
             await cleanup_duel(duel_id)
             return
 
-        # Принятие – редактируем исходное сообщение вызова
         await callback.message.edit_text(
-            f"✅ {callback.from_user.full_name} принял вызов { (await bot.get_chat(duel.challenger_id)).full_name } на дуэль",
+            f"✅ {callback.from_user.full_name} принял вызов {(await bot.get_chat(duel.challenger_id)).full_name} на дуэль",
             reply_markup=None
         )
 
-        # Определяем первого
         duel.current_turn = random.choice([duel.challenger_id, duel.target_id])
         try:
             first_user = await bot.get_chat(duel.current_turn)
@@ -554,7 +450,6 @@ async def process_invite(callback: CallbackQuery):
             duel.chat_id,
             f"Право первого выстрела предоставляется {first_name}"
         )
-        # Отправляем сообщение хода
         await send_turn_message(duel)
 
     except Exception as e:
@@ -584,11 +479,9 @@ async def process_action(callback: CallbackQuery):
         opponent_id = duel.opponent(callback.from_user.id)
         opponent = duel.players[opponent_id]
 
-        # Отменяем таймер текущего хода
         if duel.timer_task:
             duel.timer_task.cancel()
 
-        # Убираем кнопки у текущего сообщения хода
         try:
             await bot.edit_message_reply_markup(
                 chat_id=duel.chat_id,
@@ -605,7 +498,6 @@ async def process_action(callback: CallbackQuery):
         if action == "shoot":
             if player.ammo <= 0:
                 await callback.answer("Нет патронов!", show_alert=True)
-                # восстанавливаем кнопки, потому что ход не завершён
                 await bot.edit_message_reply_markup(
                     chat_id=duel.chat_id,
                     message_id=duel.current_turn_msg_id,
@@ -641,7 +533,7 @@ async def process_action(callback: CallbackQuery):
             duel.distance += 1
             if duel.distance > 20:
                 extra_msg = f"🏃 {current_name} отходит слишком далеко и позорно сбегает!"
-                opponent.hp = -1   # пометка победы
+                opponent.hp = -1
             else:
                 extra_msg = f"👣 {current_name} отдаляется. Дистанция: {duel.distance}"
 
@@ -657,11 +549,8 @@ async def process_action(callback: CallbackQuery):
             player.ammo = WEAPON["magazine"]
             extra_msg = f"🔄 {current_name} перезаряжает оружие"
 
-        # Отправляем результат действия (редактируем текущее сообщение хода или отправляем новое?)
-        # Лучше отправить новое сообщение с результатом, а текущее просто оставить без кнопок (уже сделано выше)
         await bot.send_message(duel.chat_id, extra_msg)
 
-        # Проверка завершения
         winner_id = None
         loser_id = None
         if opponent.hp <= 0:
@@ -684,7 +573,6 @@ async def process_action(callback: CallbackQuery):
             await cleanup_duel(duel_id)
             return
 
-        # Переход хода
         duel.current_turn = opponent_id
         await bot.send_message(
             duel.chat_id,
