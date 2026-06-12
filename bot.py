@@ -85,10 +85,8 @@ class DuelState:
 def calc_hit_chance(accuracy, aim_stacks, distance, weapon_range=7):
     """Формула шанса попадания (0–100)."""
     chance = accuracy + (accuracy / 2) * aim_stacks
-    # Бонус сближения: +15, если дистанция меньше половины дальнобойности (<4)
     if distance < weapon_range / 2:
         chance += 15
-    # Штраф за превышение дальности
     if distance > weapon_range:
         chance -= 10 * (distance - weapon_range)
     return max(0, min(100, int(chance)))
@@ -120,11 +118,10 @@ def generate_keyboard(duel_id, ammo):
 
 
 async def send_system_message(chat_id, text, reply_to=None):
-    """Безопасная отправка сообщения."""
+    """Безопасная отправка сообщения. Ошибки подавляются."""
     try:
         return await bot.send_message(chat_id, text, reply_to_message_id=reply_to)
-    except TelegramAPIError as e:
-        print(f"Ошибка отправки сообщения: {e}")
+    except TelegramAPIError:
         return None
 
 
@@ -137,8 +134,8 @@ async def edit_message_safe(chat_id, message_id, text, reply_markup=None):
             text=text,
             reply_markup=reply_markup,
         )
-    except TelegramAPIError as e:
-        print(f"Ошибка редактирования сообщения: {e}")
+    except TelegramAPIError:
+        pass
 
 
 async def finish_duel(duel: DuelState, winner_id=None, loser_id=None, reason=""):
@@ -147,11 +144,9 @@ async def finish_duel(duel: DuelState, winner_id=None, loser_id=None, reason="")
         return
     duel.finished = True
 
-    # Отмена таймера
     if duel.timer_task and not duel.timer_task.done():
         duel.timer_task.cancel()
 
-    # Сообщение о результате
     if winner_id and loser_id:
         winner_name = duel.initiator[1] if duel.initiator[0] == winner_id else duel.opponent[1]
         loser_name = duel.initiator[1] if duel.initiator[0] == loser_id else duel.opponent[1]
@@ -160,36 +155,24 @@ async def finish_duel(duel: DuelState, winner_id=None, loser_id=None, reason="")
             text += f"\n{reason}"
         await send_system_message(duel.chat_id, text)
 
-    # Очистка occupied
     for uid in [duel.initiator[0], duel.opponent[0]]:
         occupied.pop((duel.chat_id, uid), None)
 
-    # Удаление дуэли из активных
     active_duels.pop(duel.duel_id, None)
 
 
-async def switch_turn(duel: DuelState, next_player_id):
-    """Передаём ход следующему игроку."""
+async def switch_turn(duel: DuelState, next_player_id: int, first_turn: bool = False):
+    """Передаёт ход следующему игроку и отправляет сообщение хода."""
     if duel.finished:
         return
 
-    # Убираем кнопки у предыдущего сообщения хода
-    if duel.turn_msg_id:
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=duel.chat_id,
-                message_id=duel.turn_msg_id,
-                reply_markup=None,
-            )
-        except TelegramAPIError:
-            pass
+    # Предыдущее сообщение хода не трогаем, кнопки остаются (неактивные через проверку хода)
 
     duel.current_turn = next_player_id
     attacker_name = duel.initiator[1] if next_player_id == duel.initiator[0] else duel.opponent[1]
     opponent_id = duel.opponent_id(next_player_id)
     opponent_name = duel.opponent_name(next_player_id)
 
-    # Получаем состояние атакующего и защитника
     if next_player_id == duel.initiator[0]:
         ammo = duel.initiator_ammo
         aim = duel.initiator_aim
@@ -205,8 +188,14 @@ async def switch_turn(duel: DuelState, next_player_id):
         opp_ammo = duel.initiator_ammo
         opp_aim = duel.initiator_aim
 
+    # Формируем текст: в первом ходу добавляем информацию о праве выстрела, иначе — "Теперь черёд"
+    if first_turn:
+        header = f"⚡ Право первого выстрела предоставляется {attacker_name}\n"
+    else:
+        header = f"Теперь черёд {attacker_name} делать выстрел\n"
+
     text = (
-        f"⚡ Ход {attacker_name}\n"
+        f"{header}"
         f"📏 Дистанция: {duel.distance} шагов\n"
         f"Ваши показатели: ❤️{hp}  🔫{ammo}/6  🎯{20 + (20//2)*aim}\n"
         f"Противник: ❤️{opp_hp}  🔫{opp_ammo}/6  🎯{20 + (20//2)*opp_aim}"
@@ -216,26 +205,22 @@ async def switch_turn(duel: DuelState, next_player_id):
 
     msg = await send_system_message(duel.chat_id, text)
     if not msg:
-        # Фатальная ошибка — завершаем дуэль
         await finish_duel(duel, reason="⚠️ Не удалось отправить сообщение хода. Дуэль прервана.")
         return
 
     duel.turn_msg_id = msg.message_id
-
-    # Запуск таймера хода (120 секунд)
     duel.timer_task = asyncio.create_task(turn_timer(duel.duel_id, msg.message_id))
 
 
 async def turn_timer(duel_id: str, msg_id: int):
-    """Таймер хода: если за 120 сек не было действий, ход пропускается."""
+    """Таймер хода: 120 секунд, если нет действий — пропуск хода."""
     await asyncio.sleep(120)
     duel = active_duels.get(duel_id)
     if not duel or duel.finished:
         return
-    # Проверяем, не устарело ли сообщение (не сменился ли ход)
     if duel.turn_msg_id != msg_id or duel.processing:
         return
-    # Пропуск хода
+
     current_id = duel.current_turn
     current_name = duel.initiator[1] if current_id == duel.initiator[0] else duel.opponent[1]
     await send_system_message(duel.chat_id, f"⏰ {current_name} не сделал ход вовремя. Ход переходит противнику.")
@@ -246,49 +231,39 @@ async def execute_action(duel: DuelState, user_id: int, action: str):
     """Обработка действия игрока."""
     if duel.finished or user_id != duel.current_turn:
         return
-
-    # Блокировка повторных действий
     if duel.processing:
         return
     duel.processing = True
 
     try:
-        # Отмена таймера
         if duel.timer_task and not duel.timer_task.done():
             duel.timer_task.cancel()
 
         attacker_name = duel.initiator[1] if user_id == duel.initiator[0] else duel.opponent[1]
         opponent_id = duel.opponent_id(user_id)
         opponent_name = duel.opponent_name(user_id)
-
-        # Получаем текущие параметры атакующего
         ammo, aim, hp, _ = duel.get_attacker_state(user_id)
 
         if action == "shoot":
             if ammo <= 0:
-                # Игнорируем, кнопка должна быть неактивна
                 duel.processing = False
                 return
-
             ammo -= 1
             chance = calc_hit_chance(20, aim, duel.distance)
             hit = random.random() < (chance / 100)
             crit = hit and (random.random() < 0.05)
 
-            # Сброс прицеливания у атакующего после выстрела
             duel.set_attacker_state(user_id, ammo=ammo, aim=0)
 
             if crit:
-                # Критическое попадание — мгновенная победа
                 await send_system_message(duel.chat_id,
                     f"💥 КРИТИЧЕСКОЕ ПОПАДАНИЕ! {attacker_name} сражает {opponent_name} наповал!")
                 await finish_duel(duel, winner_id=user_id, loser_id=opponent_id)
                 return
             elif hit:
-                # Обычное попадание
                 opp_hp, _ = duel.get_defender_state(user_id)
                 opp_hp -= 1
-                duel.set_attacker_state(opponent_id, hp=opp_hp, aim=0)  # сброс прицеливания у противника
+                duel.set_attacker_state(opponent_id, hp=opp_hp, aim=0)
                 await send_system_message(duel.chat_id,
                     f"🔫🤯 Попадание! {attacker_name} ранит {opponent_name}.")
                 if opp_hp <= 0:
@@ -304,7 +279,6 @@ async def execute_action(duel: DuelState, user_id: int, action: str):
 
         elif action == "closer":
             if duel.distance <= 1:
-                # Минимальная дистанция уже, ничего не делаем
                 await send_system_message(duel.chat_id, f"👣 {attacker_name} и так вплотную.")
             else:
                 duel.distance -= 1
@@ -324,16 +298,14 @@ async def execute_action(duel: DuelState, user_id: int, action: str):
         elif action == "reload":
             if ammo != 0:
                 duel.processing = False
-                return  # нельзя перезаряжать с патронами
+                return
             duel.set_attacker_state(user_id, ammo=6)
             await send_system_message(duel.chat_id, f"🔄 {attacker_name} перезаряжает оружие")
 
-        # Переход хода
-        await send_system_message(duel.chat_id, f"Теперь черёд {opponent_name} делать выстрел")
+        # Переход хода (сообщение "Теперь черёд ..." включено в switch_turn)
         await switch_turn(duel, opponent_id)
 
-    except Exception as e:
-        print(f"Ошибка выполнения действия: {e}")
+    except Exception:
         await send_system_message(duel.chat_id, "⚠️ Произошла ошибка, дуэль прервана.")
         await finish_duel(duel)
     finally:
@@ -351,20 +323,11 @@ async def start_cmd(message: Message):
             "Чтобы вызвать на дуэль в группе, ответьте на сообщение соперника командой «Дуэль».\n"
             "Удачи!"
         )
-    else:
-        # В группах не реагируем на /start
-        pass
-
 
 @dp.message(F.text.lower() == "я")
 async def test_response(message: Message):
-    # Проверка: должен быть ответ на любое сообщение бота
     if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
         await message.answer("Я")
-    else:
-        # Если просто сообщение "Я", не отвечаем
-        pass
-
 
 @dp.message(F.text.lower().startswith("дуэль"))
 async def duel_challenge(message: Message):
@@ -375,7 +338,6 @@ async def duel_challenge(message: Message):
     caller = (message.from_user.id, message.from_user.full_name)
     target = None
 
-    # 1. Ответ на сообщение
     if message.reply_to_message:
         target_id = message.reply_to_message.from_user.id
         target_name = message.reply_to_message.from_user.full_name
@@ -387,7 +349,6 @@ async def duel_challenge(message: Message):
             return
         target = (target_id, target_name)
     else:
-        # 2. Поиск упоминания
         entities = message.entities or []
         mentioned_user = None
         for ent in entities:
@@ -395,7 +356,6 @@ async def duel_challenge(message: Message):
                 mentioned_user = (ent.user.id, ent.user.full_name)
                 break
             elif ent.type == "mention":
-                # username упоминание
                 username = message.text[ent.offset:ent.offset+ent.length].lstrip("@")
                 try:
                     chat_member = await bot.get_chat_member(message.chat.id, f"@{username}")
@@ -403,10 +363,8 @@ async def duel_challenge(message: Message):
                     mentioned_user = (user.id, user.full_name)
                     break
                 except TelegramAPIError:
-                    # Не найдём
                     pass
         if not mentioned_user:
-            # 3. Запасной вариант: Дуэль @username (без entity, если текст введён вручную)
             parts = message.text.strip().split()
             if len(parts) > 1 and parts[1].startswith("@"):
                 username = parts[1].lstrip("@")
@@ -434,19 +392,16 @@ async def duel_challenge(message: Message):
         await message.reply("Нельзя вызвать на дуэль самого себя!")
         return
 
-    # Проверка занятости
     if (message.chat.id, caller[0]) in occupied or (message.chat.id, target[0]) in occupied:
         await message.reply("Один из участников уже участвует в другой дуэли. Дождитесь завершения.")
         return
 
-    # Создание дуэли
     duel_id = uuid4().hex[:12]
     duel = DuelState(duel_id, message.chat.id, caller, target)
     active_duels[duel_id] = duel
     occupied[(message.chat.id, caller[0])] = duel_id
     occupied[(message.chat.id, target[0])] = duel_id
 
-    # Сообщение вызова
     text = (
         f"🔫 {caller[1]} вызывает {target[1]} на дуэль!\n"
         f"💬 {target[1]}, нажмите «Принять» или «Отклонить»\n"
@@ -463,7 +418,6 @@ async def duel_challenge(message: Message):
         await finish_duel(duel)
         return
 
-    # Таймер на 5 минут автоотмены
     async def auto_decline():
         await asyncio.sleep(300)
         d = active_duels.get(duel_id)
@@ -490,16 +444,13 @@ async def accept_duel(call: CallbackQuery):
         return
 
     duel.accepted = True
-    # Редактируем сообщение вызова, убираем кнопки
     await edit_message_safe(duel.chat_id, call.message.message_id,
                             f"✅ {duel.opponent[1]} принял вызов {duel.initiator[1]} на дуэль", reply_markup=None)
     await call.answer()
 
-    # Определяем первого ходящего
     first = random.choice([duel.initiator[0], duel.opponent[0]])
-    first_name = duel.initiator[1] if first == duel.initiator[0] else duel.opponent[1]
-    await send_system_message(duel.chat_id, f"Право первого выстрела предоставляется {first_name}")
-    await switch_turn(duel, first)
+    # Передаём ход с пометкой первого хода
+    await switch_turn(duel, first, first_turn=True)
 
 
 @dp.callback_query(F.data.startswith("decline_"))
@@ -521,7 +472,6 @@ async def decline_duel(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("act_"))
 async def handle_action(call: CallbackQuery):
     parts = call.data.split("_")
-    # act_shoot_<duel_id> / act_aim_<duel_id> / act_closer_<duel_id> / act_farther_<duel_id> / act_reload_<duel_id>
     if len(parts) != 3:
         return
     action = parts[1]
@@ -535,11 +485,9 @@ async def handle_action(call: CallbackQuery):
         return
 
     await call.answer()
-    # Запускаем выполнение действия (уже с блокировкой)
     await execute_action(duel, call.from_user.id, action)
 
 
-# ---------- Запуск ----------
 async def main():
     await dp.start_polling(bot)
 
