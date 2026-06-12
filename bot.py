@@ -64,13 +64,13 @@ class DuelSession:
     players: Dict[int, PlayerState] = field(default_factory=dict)
     timer_task: Optional[asyncio.Task] = None
     current_turn_msg_id: Optional[int] = None
-    processing: bool = False  # защита от параллельных действий
+    processing: bool = False
 
     def opponent(self, user_id: int) -> int:
         return self.challenger_id if user_id == self.target_id else self.target_id
 
 active_duels: Dict[str, DuelSession] = {}
-occupied: dict[tuple[int, int], str] = {}
+occupied: dict[tuple[int, int], str] = {}   # <-- ВАЖНО: эта строка должна быть
 
 # --------------------------
 # Инициализация бота
@@ -116,7 +116,6 @@ def build_action_keyboard(duel: DuelSession) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 async def restore_buttons(duel: DuelSession, msg_id: int):
-    """Пытается вернуть кнопки в сообщение хода."""
     try:
         await bot.edit_message_reply_markup(
             chat_id=duel.chat_id,
@@ -127,7 +126,6 @@ async def restore_buttons(duel: DuelSession, msg_id: int):
         logger.warning(f"Не удалось восстановить кнопки: {e}")
 
 async def send_turn_message(duel: DuelSession):
-    """Отправляет сообщение с кнопками и запускает таймер хода."""
     if duel.duel_id not in active_duels:
         return
     try:
@@ -161,7 +159,6 @@ async def send_turn_message(duel: DuelSession):
     duel.timer_task = asyncio.create_task(auto_skip_turn(duel, duel.current_turn_msg_id))
 
 async def auto_skip_turn(duel: DuelSession, expected_msg_id: int):
-    """Ждёт 120 секунд, и если ход не сменился – передаёт ход."""
     await asyncio.sleep(120)
     if duel.duel_id not in active_duels:
         return
@@ -195,7 +192,7 @@ async def cleanup_duel(duel_id: str):
     if duel_id not in active_duels:
         return
     duel = active_duels[duel_id]
-    duel.processing = True  # блокируем новые действия
+    duel.processing = True
     if duel.timer_task:
         duel.timer_task.cancel()
     occupied.pop((duel.chat_id, duel.challenger_id), None)
