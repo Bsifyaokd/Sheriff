@@ -171,21 +171,90 @@ async def duel_cancel_text(message: Message):
 @router.message(F.text.lower().startswith("дуэль"), F.chat.type.in_({"group", "supergroup"}))
 async def duel_command(message: Message):
     try:
+        # ----- 1. Обработка ответа на сообщение -----
+        if message.reply_to_message:
+            target_user = message.reply_to_message.from_user
+            if target_user.is_bot:
+                await message.reply("Нельзя вызвать бота на дуэль.")
+                return
+            if target_user.id == message.from_user.id:
+                await message.reply("Нельзя вызвать на дуэль самого себя.")
+                return
+            # проверяем занятость
+            key_challenger = (message.chat.id, message.from_user.id)
+            key_target = (message.chat.id, target_user.id)
+            if key_challenger in occupied or key_target in occupied:
+                await message.reply("Один из участников уже участвует в другой дуэли.")
+                return
+
+            # создаём дуэль
+            duel_id = uuid.uuid4().hex[:12]
+            duel = DuelSession(
+                duel_id=duel_id,
+                chat_id=message.chat.id,
+                challenger_id=message.from_user.id,
+                target_id=target_user.id,
+                current_turn=0,
+                players={
+                    message.from_user.id: PlayerState(),
+                    target_user.id: PlayerState(),
+                }
+            )
+            active_duels[duel_id] = duel
+            occupied[key_challenger] = duel_id
+            occupied[key_target] = duel_id
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{duel_id}"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decline_{duel_id}"),
+                ]
+            ])
+            msg = await message.answer(
+                f"🔫 {message.from_user.full_name} вызывает {target_user.full_name} на дуэль!\n"
+                f"У вас 60 секунд, чтобы принять.",
+                reply_markup=kb
+            )
+
+            async def auto_cancel():
+                await asyncio.sleep(60)
+                if duel_id in active_duels:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=duel.chat_id,
+                            message_id=msg.message_id,
+                            text="⏰ Время вышло, вызов отменён."
+                        )
+                    except Exception as e:
+                        logger.warning(f"Ошибка при автоотмене: {e}")
+                    finally:
+                        await cleanup_duel(duel_id)
+
+            asyncio.create_task(auto_cancel())
+            return   # конец обработки reply
+
+        # ----- 2. Вызов по @username (старый код) -----
         parts = message.text.split()
         if len(parts) < 2:
-            await message.reply("Укажите противника: Дуэль @username")
+            await message.reply(
+                "Укажите противника через @username или "
+                "ответьте командой «Дуэль» на сообщение игрока."
+            )
             return
 
         target_username = parts[1]
         if not target_username.startswith("@"):
-            await message.reply("Используйте @username.")
+            await message.reply("Используйте @username или ответьте на сообщение игрока.")
             return
         target_username = target_username.lstrip("@")
 
         try:
             target_user = await bot.get_chat(f"@{target_username}")
         except Exception:
-            await message.reply("Не удалось найти игрока с таким username. Убедитесь, что он есть в Telegram.")
+            await message.reply(
+                "Не удалось найти игрока с таким username.\n"
+                "Попробуйте ответить командой «Дуэль» на сообщение нужного игрока."
+            )
             return
 
         if target_user.id == message.from_user.id:
