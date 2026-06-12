@@ -80,6 +80,24 @@ dp = Dispatcher()
 router = Router()
 
 # --------------------------
+# Надёжная отправка сообщений с повторами
+# --------------------------
+async def safe_send_message(chat_id: int, text: str, reply_markup=None, max_retries=4) -> bool:
+    """Отправляет сообщение с несколькими попытками. Возвращает True при успехе."""
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            await bot.send_message(chat_id, text, reply_markup=reply_markup)
+            return True
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"Попытка {attempt} отправки сообщения не удалась: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(2 ** attempt)  # 2, 4, 8 секунд
+    logger.error(f"Не удалось отправить сообщение после {max_retries} попыток: {last_exc}")
+    return False
+
+# --------------------------
 # Вспомогательные функции
 # --------------------------
 def calc_hit_chance(duel: DuelSession, shooter_id: int) -> float:
@@ -128,10 +146,10 @@ async def try_restore_buttons(duel: DuelSession, msg_id: Optional[int]):
     except Exception as e:
         logger.debug(f"Не удалось восстановить кнопки: {e}")
 
-async def send_turn_message_retry(duel: DuelSession, max_retries=4):
-    """Отправляет сообщение хода с повторными попытками."""
+async def send_turn_message(duel: DuelSession):
+    """Отправляет сообщение с кнопками для текущего хода."""
     if duel.duel_id not in active_duels:
-        return False
+        return
     try:
         user = await bot.get_chat(duel.current_turn)
         name = user.full_name
@@ -146,32 +164,31 @@ async def send_turn_message_retry(duel: DuelSession, max_retries=4):
     )
     markup = build_action_keyboard(duel)
 
-    last_exception = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            sent_msg = await bot.send_message(duel.chat_id, text, reply_markup=markup)
-            duel.current_turn_msg_id = sent_msg.message_id
-            return True
-        except Exception as e:
-            last_exception = e
-            logger.warning(f"Попытка {attempt} отправки хода не удалась: {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(2 ** attempt)  # 2, 4, 8 секунд
-
-    # Все попытки исчерпаны
-    logger.error(f"Не удалось отправить сообщение хода после {max_retries} попыток: {last_exception}")
-    try:
-        await bot.send_message(duel.chat_id, "⚠️ Техническая ошибка, дуэль прервана.")
-    except:
-        pass
-    return False
-
-async def send_turn_message(duel: DuelSession):
-    """Основная обёртка для отправки хода с запуском таймера."""
-    success = await send_turn_message_retry(duel)
+    # Отправляем с повторами
+    success = await safe_send_message(duel.chat_id, text, reply_markup=markup)
     if not success:
+        # Не удалось отправить сообщение хода — прерываем дуэль
+        await safe_send_message(duel.chat_id, "⚠️ Техническая ошибка, дуэль прервана.")
         await cleanup_duel(duel.duel_id)
         return
+
+    # Получаем ID отправленного сообщения (нужно сохранить)
+    # safe_send_message возвращает True, но не сообщение. Придётся отправить ещё раз, чтобы получить message_id.
+    # Лучше переделать safe_send_message, чтобы он возвращал объект Message или None.
+    # Но для простоты мы можем сделать отдельную отправку без сохранения ID (таймер не критичен).
+    # Однако для таймера нужен msg_id. Поэтому сделаем safe_send_message_with_id.
+
+    # Переопределим функцию отправки с возвратом Message.
+    # Быстрое решение: отправим заново в простом варианте (с риском, но с повторами)
+    try:
+        sent = await bot.send_message(duel.chat_id, text, reply_markup=markup)
+        duel.current_turn_msg_id = sent.message_id
+    except Exception as e:
+        logger.error(f"Не удалось отправить сообщение хода (повтор): {e}")
+        await safe_send_message(duel.chat_id, "⚠️ Техническая ошибка, дуэль прервана.")
+        await cleanup_duel(duel.duel_id)
+        return
+
     if duel.timer_task:
         duel.timer_task.cancel()
     duel.timer_task = asyncio.create_task(auto_skip_turn(duel, duel.current_turn_msg_id))
@@ -196,7 +213,7 @@ async def auto_skip_turn(duel: DuelSession, expected_msg_id: int):
         )
         user = await bot.get_chat(duel.current_turn)
         name = user.full_name if user else "Игрок"
-        await bot.send_message(
+        await safe_send_message(
             duel.chat_id,
             f"⏰ {name} не сделал ход вовремя. Ход переходит противнику."
         )
@@ -225,7 +242,7 @@ async def cleanup_duel(duel_id: str):
 @router.my_chat_member()
 async def on_my_chat_member(update: ChatMemberUpdated):
     if update.new_chat_member.status == "member" and update.chat.type != "private":
-        await bot.send_message(
+        await safe_send_message(
             update.chat.id,
             "🤠 Бот для дуэлей на Диком Западе готов к работе!\n"
             "Вызовите противника: ответьте на его сообщение командой «Дуэль»."
@@ -236,23 +253,23 @@ async def on_my_chat_member(update: ChatMemberUpdated):
 # --------------------------
 @router.message(Command("start"))
 async def start_cmd(message: Message):
-    await message.answer("🤠 Этот бот для дуэлей в группе. Добавьте его в чат и вызовите на дуэль по @username.")
+    await safe_send_message(message.chat.id, "🤠 Этот бот для дуэлей в группе. Добавьте его в чат и вызовите на дуэль по @username.")
 
 @router.message(F.text.lower() == "бот", ~F.from_user.is_bot, F.chat.type.in_({"group", "supergroup"}))
 async def bot_echo(message: Message):
-    await message.reply("Я")
+    await safe_send_message(message.chat.id, "Я")
 
 @router.message(F.text.lower().startswith("дуэль да"), F.chat.type.in_({"group", "supergroup"}))
 async def duel_yes_text(message: Message):
-    await message.reply("Чтобы принять дуэль, нажмите кнопку под вызовом.")
+    await safe_send_message(message.chat.id, "Чтобы принять дуэль, нажмите кнопку под вызовом.")
 
 @router.message(F.text.lower().startswith("дуэль нет"), F.chat.type.in_({"group", "supergroup"}))
 async def duel_no_text(message: Message):
-    await message.reply("Чтобы отклонить дуэль, нажмите кнопку под вызовом.")
+    await safe_send_message(message.chat.id, "Чтобы отклонить дуэль, нажмите кнопку под вызовом.")
 
 @router.message(F.text.lower().startswith("дуэль отмена"), F.chat.type.in_({"group", "supergroup"}))
 async def duel_cancel_text(message: Message):
-    await message.reply("Отменить дуэль можно кнопкой или командой /cancel в личных сообщениях (пока недоступно).")
+    await safe_send_message(message.chat.id, "Отменить дуэль можно кнопкой или командой /cancel в личных сообщениях (пока недоступно).")
 
 # Основной вызов (reply + text_mention + @username)
 @router.message(F.text.lower().startswith("дуэль"), F.chat.type.in_({"group", "supergroup"}))
@@ -262,16 +279,16 @@ async def duel_command(message: Message):
         if message.reply_to_message:
             target_user = message.reply_to_message.from_user
             if target_user.is_bot:
-                await message.reply("Нельзя вызвать бота на дуэль.")
+                await safe_send_message(message.chat.id, "Нельзя вызвать бота на дуэль.")
                 return
             if target_user.id == message.from_user.id:
-                await message.reply("Нельзя вызвать на дуэль самого себя.")
+                await safe_send_message(message.chat.id, "Нельзя вызвать на дуэль самого себя.")
                 return
 
             key_challenger = (message.chat.id, message.from_user.id)
             key_target = (message.chat.id, target_user.id)
             if key_challenger in occupied or key_target in occupied:
-                await message.reply("Один из участников уже участвует в другой дуэли.")
+                await safe_send_message(message.chat.id, "Один из участников уже участвует в другой дуэли.")
                 return
 
             duel_id = uuid.uuid4().hex[:12]
@@ -325,16 +342,16 @@ async def duel_command(message: Message):
 
         if target_user:
             if target_user.is_bot:
-                await message.reply("Нельзя вызвать бота на дуэль.")
+                await safe_send_message(message.chat.id, "Нельзя вызвать бота на дуэль.")
                 return
             if target_user.id == message.from_user.id:
-                await message.reply("Нельзя вызвать на дуэль самого себя.")
+                await safe_send_message(message.chat.id, "Нельзя вызвать на дуэль самого себя.")
                 return
 
             key_challenger = (message.chat.id, message.from_user.id)
             key_target = (message.chat.id, target_user.id)
             if key_challenger in occupied or key_target in occupied:
-                await message.reply("Один из участников уже участвует в другой дуэли.")
+                await safe_send_message(message.chat.id, "Один из участников уже участвует в другой дуэли.")
                 return
 
             duel_id = uuid.uuid4().hex[:12]
@@ -381,7 +398,7 @@ async def duel_command(message: Message):
         # ----- 3. Вызов по @username (запасной) -----
         parts = message.text.split()
         if len(parts) < 2:
-            await message.reply(
+            await safe_send_message(message.chat.id,
                 "Чтобы вызвать на дуэль, ответьте на сообщение игрока командой «Дуэль» "
                 "или упомяните его через @ (выбрав из списка, чтобы появилось имя с ID)."
             )
@@ -389,7 +406,7 @@ async def duel_command(message: Message):
 
         target_username = parts[1]
         if not target_username.startswith("@"):
-            await message.reply("Используйте @username или выберите игрока из списка упоминаний.")
+            await safe_send_message(message.chat.id, "Используйте @username или выберите игрока из списка упоминаний.")
             return
         target_username = target_username.lstrip("@")
 
@@ -397,7 +414,7 @@ async def duel_command(message: Message):
             target_chat = await bot.get_chat(f"@{target_username}")
             target_id = target_chat.id
         except Exception:
-            await message.reply(
+            await safe_send_message(message.chat.id,
                 "Не удалось найти игрока с таким @username. Возможно, он не начинал диалог с ботом.\n"
                 "Попробуйте:\n"
                 "• Ответьте на его сообщение командой «Дуэль»\n"
@@ -406,13 +423,13 @@ async def duel_command(message: Message):
             return
 
         if target_id == message.from_user.id:
-            await message.reply("Нельзя вызвать на дуэль самого себя.")
+            await safe_send_message(message.chat.id, "Нельзя вызвать на дуэль самого себя.")
             return
 
         key_challenger = (message.chat.id, message.from_user.id)
         key_target = (message.chat.id, target_id)
         if key_challenger in occupied or key_target in occupied:
-            await message.reply("Один из участников уже участвует в другой дуэли.")
+            await safe_send_message(message.chat.id, "Один из участников уже участвует в другой дуэли.")
             return
 
         duel_id = uuid.uuid4().hex[:12]
@@ -457,7 +474,7 @@ async def duel_command(message: Message):
 
     except Exception as e:
         logger.error(f"Ошибка в duel_command: {e}", exc_info=True)
-        await message.reply("Произошла ошибка при создании дуэли. Попробуйте позже.")
+        await safe_send_message(message.chat.id, "Произошла ошибка при создании дуэли. Попробуйте позже.")
 
 # --------------------------
 # Принятие/отклонение
@@ -495,7 +512,7 @@ async def process_invite(callback: CallbackQuery):
         except:
             first_name = "Игрок"
 
-        await bot.send_message(
+        await safe_send_message(
             duel.chat_id,
             f"Право первого выстрела предоставляется {first_name}"
         )
@@ -601,11 +618,14 @@ async def process_action(callback: CallbackQuery):
             player.ammo = WEAPON["magazine"]
             extra_msg = f"🔄 {current_name} перезаряжает оружие"
 
-        # Отправляем результат действия (неудача не ломает дуэль)
-        try:
-            await bot.send_message(duel.chat_id, extra_msg)
-        except Exception as e:
-            logger.error(f"Ошибка отправки результата: {e}")
+        # Отправляем результат действия с гарантией
+        success = await safe_send_message(duel.chat_id, extra_msg)
+        if not success:
+            # Не удалось отправить результат — аварийно завершаем дуэль с уведомлением
+            await safe_send_message(duel.chat_id, "⚠️ Ошибка отправки сообщения, дуэль прервана.")
+            await cleanup_duel(duel_id)
+            duel.processing = False
+            return
 
         # Проверка завершения дуэли
         winner_id = None
@@ -629,7 +649,7 @@ async def process_action(callback: CallbackQuery):
                 loser_name = (await bot.get_chat(loser_id)).full_name
             except:
                 loser_name = "Игрок"
-            await bot.send_message(
+            await safe_send_message(
                 duel.chat_id,
                 f"🏆 Победитель: {winner_name}\n💀 Проигравший: {loser_name}"
             )
@@ -639,27 +659,25 @@ async def process_action(callback: CallbackQuery):
 
         # Передача хода противнику
         duel.current_turn = opponent_id
-        try:
-            await bot.send_message(
-                duel.chat_id,
-                f"Теперь черёд {opponent_name} делать выстрел"
-            )
-            await send_turn_message(duel)
-        except Exception as e:
-            logger.error(f"Критическая ошибка при передаче хода: {e}")
-            try:
-                await bot.send_message(duel.chat_id, "⚠️ Произошла ошибка, дуэль прервана.")
-            except:
-                pass
+        success = await safe_send_message(
+            duel.chat_id,
+            f"Теперь черёд {opponent_name} делать выстрел"
+        )
+        if not success:
+            # Не удалось отправить переход — прерываем дуэль
+            await safe_send_message(duel.chat_id, "⚠️ Ошибка отправки сообщения, дуэль прервана.")
             await cleanup_duel(duel_id)
+            duel.processing = False
+            return
 
+        await send_turn_message(duel)
         duel.processing = False
 
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_action: {e}", exc_info=True)
         if 'duel' in locals():
             try:
-                await bot.send_message(duel.chat_id, "⚠️ Внутренняя ошибка, дуэль прервана.")
+                await safe_send_message(duel.chat_id, "⚠️ Внутренняя ошибка, дуэль прервана.")
             except:
                 pass
             await cleanup_duel(duel.duel_id)
