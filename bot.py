@@ -64,12 +64,10 @@ class DuelSession:
     players: Dict[int, PlayerState] = field(default_factory=dict)
     timer_task: Optional[asyncio.Task] = None
     current_turn_msg_id: Optional[int] = None
+    processing: bool = False  # флаг защиты от параллельных действий
 
     def opponent(self, user_id: int) -> int:
         return self.challenger_id if user_id == self.target_id else self.target_id
-
-active_duels: Dict[str, DuelSession] = {}
-occupied: dict[tuple[int, int], str] = {}
 
 # --------------------------
 # Инициализация бота
@@ -115,6 +113,9 @@ def build_action_keyboard(duel: DuelSession) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 async def send_turn_message(duel: DuelSession):
+    """Отправляет сообщение с кнопками и запускает таймер хода."""
+    if duel.duel_id not in active_duels:
+        return
     try:
         user = await bot.get_chat(duel.current_turn)
         name = user.full_name
@@ -128,35 +129,59 @@ async def send_turn_message(duel: DuelSession):
         f"Противник: {format_player_state(duel, duel.opponent(duel.current_turn))}"
     )
 
-    sent_msg = await bot.send_message(
-        duel.chat_id,
-        text,
-        reply_markup=build_action_keyboard(duel)
-    )
-    duel.current_turn_msg_id = sent_msg.message_id
+    try:
+        sent_msg = await bot.send_message(
+            duel.chat_id,
+            text,
+            reply_markup=build_action_keyboard(duel)
+        )
+        duel.current_turn_msg_id = sent_msg.message_id
+    except Exception as e:
+        logger.error(f"Не удалось отправить сообщение хода: {e}")
+        # Пытаемся восстановиться – завершаем дуэль с ничьей
+        await bot.send_message(duel.chat_id, "⚠️ Техническая ошибка, дуэль прервана.")
+        await cleanup_duel(duel.duel_id)
+        return
 
+    # Отменяем старый таймер, если есть
     if duel.timer_task:
         duel.timer_task.cancel()
-    duel.timer_task = asyncio.create_task(auto_skip_turn(duel))
+    # Запускаем таймер авто-пропуска хода
+    duel.timer_task = asyncio.create_task(auto_skip_turn(duel, duel.current_turn_msg_id))
 
-async def auto_skip_turn(duel: DuelSession):
+async def auto_skip_turn(duel: DuelSession, expected_msg_id: int):
+    """Ждёт 120 секунд, и если ход всё ещё у того же игрока – передаёт ход."""
     await asyncio.sleep(120)
-    if duel.duel_id in active_duels and duel.current_turn_msg_id is not None:
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=duel.chat_id,
-                message_id=duel.current_turn_msg_id,
-                reply_markup=None
-            )
-            user = await bot.get_chat(duel.current_turn)
-            name = user.full_name if user else "Игрок"
-            await bot.send_message(
-                duel.chat_id,
-                f"⏰ {name} не сделал ход вовремя. Ход переходит противнику."
-            )
-        except Exception as e:
-            logger.warning(f"Ошибка при пропуске хода: {e}")
+    # Проверяем, что дуэль всё ещё активна и с момента запуска таймера ничего не изменилось
+    if duel.duel_id not in active_duels:
+        return
+    if duel.processing:
+        # Идёт обработка действия, подождём ещё и проверим позже (однократно)
+        await asyncio.sleep(10)
+        if duel.duel_id not in active_duels or duel.processing:
+            return
+    if duel.current_turn_msg_id != expected_msg_id:
+        # Уже другой ход, ничего не делаем
+        return
 
+    try:
+        # Убираем кнопки у сообщения хода
+        await bot.edit_message_reply_markup(
+            chat_id=duel.chat_id,
+            message_id=expected_msg_id,
+            reply_markup=None
+        )
+        user = await bot.get_chat(duel.current_turn)
+        name = user.full_name if user else "Игрок"
+        await bot.send_message(
+            duel.chat_id,
+            f"⏰ {name} не сделал ход вовремя. Ход переходит противнику."
+        )
+    except Exception as e:
+        logger.warning(f"Ошибка при пропуске хода: {e}")
+
+    # Передаём ход, если дуэль всё ещё активна
+    if duel.duel_id in active_duels:
         duel.current_turn = duel.opponent(duel.current_turn)
         await send_turn_message(duel)
 
