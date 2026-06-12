@@ -479,9 +479,15 @@ async def process_action(callback: CallbackQuery):
         opponent_id = duel.opponent(callback.from_user.id)
         opponent = duel.players[opponent_id]
 
+        # Сохраняем текущее сообщение хода на случай ошибки
+        saved_msg_id = duel.current_turn_msg_id
+        saved_turn = duel.current_turn
+
+        # Отменяем таймер текущего хода
         if duel.timer_task:
             duel.timer_task.cancel()
 
+        # Убираем кнопки у текущего сообщения хода
         try:
             await bot.edit_message_reply_markup(
                 chat_id=duel.chat_id,
@@ -493,16 +499,23 @@ async def process_action(callback: CallbackQuery):
 
         extra_msg = ""
         current_name = callback.from_user.full_name
-        opponent_name = (await bot.get_chat(opponent_id)).full_name
+        try:
+            opponent_name = (await bot.get_chat(opponent_id)).full_name
+        except:
+            opponent_name = "Игрок"
 
         if action == "shoot":
             if player.ammo <= 0:
                 await callback.answer("Нет патронов!", show_alert=True)
-                await bot.edit_message_reply_markup(
-                    chat_id=duel.chat_id,
-                    message_id=duel.current_turn_msg_id,
-                    reply_markup=build_action_keyboard(duel)
-                )
+                # Восстанавливаем кнопки, потому что ход не завершён
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=duel.chat_id,
+                        message_id=duel.current_turn_msg_id,
+                        reply_markup=build_action_keyboard(duel)
+                    )
+                except:
+                    pass
                 return
             player.ammo -= 1
             chance = calc_hit_chance(duel, callback.from_user.id)
@@ -540,17 +553,36 @@ async def process_action(callback: CallbackQuery):
         elif action == "reload":
             if player.ammo == WEAPON["magazine"]:
                 await callback.answer("Магазин уже полон.", show_alert=True)
-                await bot.edit_message_reply_markup(
-                    chat_id=duel.chat_id,
-                    message_id=duel.current_turn_msg_id,
-                    reply_markup=build_action_keyboard(duel)
-                )
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=duel.chat_id,
+                        message_id=duel.current_turn_msg_id,
+                        reply_markup=build_action_keyboard(duel)
+                    )
+                except:
+                    pass
                 return
             player.ammo = WEAPON["magazine"]
             extra_msg = f"🔄 {current_name} перезаряжает оружие"
 
-        await bot.send_message(duel.chat_id, extra_msg)
+        # Отправляем результат действия
+        try:
+            await bot.send_message(duel.chat_id, extra_msg)
+        except Exception as e:
+            logger.error(f"Ошибка при отправке результата: {e}")
+            # Пытаемся восстановить кнопки
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=duel.chat_id,
+                    message_id=saved_msg_id,
+                    reply_markup=build_action_keyboard(duel)
+                )
+            except:
+                pass
+            await callback.answer("Ошибка отправки сообщения. Попробуйте ещё раз.", show_alert=True)
+            return
 
+        # Проверка завершения
         winner_id = None
         loser_id = None
         if opponent.hp <= 0:
@@ -564,8 +596,14 @@ async def process_action(callback: CallbackQuery):
             loser_id = callback.from_user.id
 
         if winner_id is not None:
-            winner_name = (await bot.get_chat(winner_id)).full_name
-            loser_name = (await bot.get_chat(loser_id)).full_name
+            try:
+                winner_name = (await bot.get_chat(winner_id)).full_name
+            except:
+                winner_name = "Игрок"
+            try:
+                loser_name = (await bot.get_chat(loser_id)).full_name
+            except:
+                loser_name = "Игрок"
             await bot.send_message(
                 duel.chat_id,
                 f"🏆 Победитель: {winner_name}\n💀 Проигравший: {loser_name}"
@@ -573,16 +611,43 @@ async def process_action(callback: CallbackQuery):
             await cleanup_duel(duel_id)
             return
 
+        # Переход хода
         duel.current_turn = opponent_id
-        await bot.send_message(
-            duel.chat_id,
-            f"Теперь черёд {opponent_name} делать выстрел"
-        )
-        await send_turn_message(duel)
+        try:
+            await bot.send_message(
+                duel.chat_id,
+                f"Теперь черёд {opponent_name} делать выстрел"
+            )
+            await send_turn_message(duel)
+        except Exception as e:
+            logger.error(f"Ошибка при переходе хода: {e}")
+            # Критично – пытаемся восстановить кнопки у предыдущего игрока
+            duel.current_turn = saved_turn   # откатываем ход, чтобы кнопки были актуальны
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=duel.chat_id,
+                    message_id=saved_msg_id,
+                    reply_markup=build_action_keyboard(duel)
+                )
+            except:
+                pass
+            await callback.answer("Ошибка при передаче хода. Попробуйте снова.", show_alert=True)
+            return
 
     except Exception as e:
-        logger.error(f"Ошибка в process_action: {e}", exc_info=True)
+        logger.error(f"Непредвиденная ошибка в process_action: {e}", exc_info=True)
+        # Пытаемся восстановить кнопки, если это возможно
+        if 'duel' in locals() and 'saved_msg_id' in locals():
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=duel.chat_id,
+                    message_id=saved_msg_id,
+                    reply_markup=build_action_keyboard(duel)
+                )
+            except:
+                pass
         await callback.answer("Произошла ошибка. Попробуйте снова.", show_alert=True)
+
 
 # --------------------------
 # Запуск
