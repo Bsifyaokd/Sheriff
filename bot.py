@@ -118,6 +118,11 @@ async def cleanup_duel(duel_id: str):
 async def start_cmd(message: Message):
     await message.answer("🤠 Бот для дуэлей в группе. Добавьте в чат и вызовите: Дуэль @username")
 
+@router.message(F.text.lower() == "бот")
+async def bot_echo(message: Message):
+    if message.chat.type != "private":
+        await message.reply("Я")
+
 @router.message(F.text.lower().startswith("дуэль"))
 async def duel_command(message: Message):
     if message.chat.type == "private":
