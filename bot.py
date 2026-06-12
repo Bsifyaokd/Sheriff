@@ -304,8 +304,166 @@ async def duel_command(message: Message):
             await message.reply("Нельзя вызвать на дуэль самого себя.")
             return
 
+@router.message(F.text.lower().startswith("дуэль"), F.chat.type.in_({"group", "supergroup"}))
+async def duel_command(message: Message):
+    try:
+        # ----- 1. Обработка ответа на сообщение (reply) -----
+        if message.reply_to_message:
+            target_user = message.reply_to_message.from_user
+            if target_user.is_bot:
+                await message.reply("Нельзя вызвать бота на дуэль.")
+                return
+            if target_user.id == message.from_user.id:
+                await message.reply("Нельзя вызвать на дуэль самого себя.")
+                return
+
+            key_challenger = (message.chat.id, message.from_user.id)
+            key_target = (message.chat.id, target_user.id)
+            if key_challenger in occupied or key_target in occupied:
+                await message.reply("Один из участников уже участвует в другой дуэли.")
+                return
+
+            duel_id = uuid.uuid4().hex[:12]
+            duel = DuelSession(
+                duel_id=duel_id,
+                chat_id=message.chat.id,
+                challenger_id=message.from_user.id,
+                target_id=target_user.id,
+                current_turn=0,
+                players={
+                    message.from_user.id: PlayerState(),
+                    target_user.id: PlayerState(),
+                }
+            )
+            active_duels[duel_id] = duel
+            occupied[key_challenger] = duel_id
+            occupied[key_target] = duel_id
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{duel_id}"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decline_{duel_id}"),
+                ]
+            ])
+            inv_msg = await message.answer(
+                f"🔫 {message.from_user.full_name} вызывает {target_user.full_name} на дуэль!\n"
+                f"💬 {target_user.full_name}, нажмите «Принять» или «Отклонить»\n"
+                f"На принятие решения у вас есть 5 минут.",
+                reply_markup=kb
+            )
+
+            async def auto_cancel():
+                await asyncio.sleep(300)  # 5 минут
+                if duel_id in active_duels:
+                    try:
+                        await inv_msg.edit_text("⏰ Время вышло, вызов отменён.", reply_markup=None)
+                    except:
+                        pass
+                    await cleanup_duel(duel_id)
+
+            asyncio.create_task(auto_cancel())
+            return
+
+        # ----- 2. Вызов по @username или text_mention -----
+        target_user = None
+
+        # Ищем text_mention (упоминание с ID — когда пользователь выбран из списка)
+        if message.entities:
+            for entity in message.entities:
+                if entity.type == "text_mention" and entity.user:
+                    target_user = entity.user
+                    break
+
+        # Если text_mention найден, используем его
+        if target_user:
+            if target_user.is_bot:
+                await message.reply("Нельзя вызвать бота на дуэль.")
+                return
+            if target_user.id == message.from_user.id:
+                await message.reply("Нельзя вызвать на дуэль самого себя.")
+                return
+
+            key_challenger = (message.chat.id, message.from_user.id)
+            key_target = (message.chat.id, target_user.id)
+            if key_challenger in occupied or key_target in occupied:
+                await message.reply("Один из участников уже участвует в другой дуэли.")
+                return
+
+            duel_id = uuid.uuid4().hex[:12]
+            duel = DuelSession(
+                duel_id=duel_id,
+                chat_id=message.chat.id,
+                challenger_id=message.from_user.id,
+                target_id=target_user.id,
+                current_turn=0,
+                players={
+                    message.from_user.id: PlayerState(),
+                    target_user.id: PlayerState(),
+                }
+            )
+            active_duels[duel_id] = duel
+            occupied[key_challenger] = duel_id
+            occupied[key_target] = duel_id
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{duel_id}"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"decline_{duel_id}"),
+                ]
+            ])
+            inv_msg = await message.answer(
+                f"🔫 {message.from_user.full_name} вызывает {target_user.full_name} на дуэль!\n"
+                f"💬 {target_user.full_name}, нажмите «Принять» или «Отклонить»\n"
+                f"На принятие решения у вас есть 5 минут.",
+                reply_markup=kb
+            )
+
+            async def auto_cancel():
+                await asyncio.sleep(300)
+                if duel_id in active_duels:
+                    try:
+                        await inv_msg.edit_text("⏰ Время вышло, вызов отменён.", reply_markup=None)
+                    except:
+                        pass
+                    await cleanup_duel(duel_id)
+
+            asyncio.create_task(auto_cancel())
+            return
+
+        # ----- 3. Старый вызов по @username (когда нет text_mention) -----
+        parts = message.text.split()
+        if len(parts) < 2:
+            await message.reply(
+                "Чтобы вызвать на дуэль, ответьте на сообщение игрока командой «Дуэль» "
+                "или упомяните его через @ (выбрав из списка, чтобы появилось имя с ID)."
+            )
+            return
+
+        target_username = parts[1]
+        if not target_username.startswith("@"):
+            await message.reply("Используйте @username или выберите игрока из списка упоминаний.")
+            return
+        target_username = target_username.lstrip("@")
+
+        # Пытаемся получить пользователя через get_chat (может не сработать)
+        try:
+            target_chat = await bot.get_chat(f"@{target_username}")
+            target_id = target_chat.id
+        except Exception:
+            await message.reply(
+                "Не удалось найти игрока с таким @username. Возможно, он не начинал диалог с ботом.\n"
+                "Попробуйте:\n"
+                "• Ответьте на его сообщение командой «Дуэль»\n"
+                "• Или введите @ и выберите его из всплывающего списка (тогда передастся ID)"
+            )
+            return
+
+        if target_id == message.from_user.id:
+            await message.reply("Нельзя вызвать на дуэль самого себя.")
+            return
+
         key_challenger = (message.chat.id, message.from_user.id)
-        key_target = (message.chat.id, target_user.id)
+        key_target = (message.chat.id, target_id)
         if key_challenger in occupied or key_target in occupied:
             await message.reply("Один из участников уже участвует в другой дуэли.")
             return
@@ -315,11 +473,11 @@ async def duel_command(message: Message):
             duel_id=duel_id,
             chat_id=message.chat.id,
             challenger_id=message.from_user.id,
-            target_id=target_user.id,
+            target_id=target_id,
             current_turn=0,
             players={
                 message.from_user.id: PlayerState(),
-                target_user.id: PlayerState(),
+                target_id: PlayerState(),
             }
         )
         active_duels[duel_id] = duel
@@ -334,8 +492,8 @@ async def duel_command(message: Message):
         ])
         inv_msg = await message.answer(
             f"🔫 {message.from_user.full_name} вызывает @{target_username} на дуэль!\n"
-            f"💬 Для принятия нажмите кнопку «Принять» или «Отклонить»\n"
-            f"У вас 5 минут.",
+            f"💬 @{target_username}, нажмите «Принять» или «Отклонить»\n"
+            f"На принятие решения у вас есть 5 минут.",
             reply_markup=kb
         )
 
