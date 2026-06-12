@@ -70,7 +70,7 @@ class DuelSession:
         return self.challenger_id if user_id == self.target_id else self.target_id
 
 active_duels: Dict[str, DuelSession] = {}
-occupied: dict[tuple[int, int], str] = {}   # <-- ОБЯЗАТЕЛЬНАЯ СТРОКА
+occupied: dict[tuple[int, int], str] = {}   # ОБЯЗАТЕЛЬНО
 
 # --------------------------
 # Инициализация бота
@@ -115,6 +115,19 @@ def build_action_keyboard(duel: DuelSession) -> InlineKeyboardMarkup:
     builder.adjust(2, 2)
     return builder.as_markup()
 
+async def try_restore_buttons(duel: DuelSession, msg_id: Optional[int]):
+    """Безопасно пытается вернуть кнопки, не вызывая исключений."""
+    if not msg_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=duel.chat_id,
+            message_id=msg_id,
+            reply_markup=build_action_keyboard(duel)
+        )
+    except Exception as e:
+        logger.debug(f"Не удалось восстановить кнопки: {e}")
+
 async def send_turn_message(duel: DuelSession):
     """Отправляет сообщение с кнопками и запускает таймер хода."""
     if duel.duel_id not in active_duels:
@@ -141,7 +154,11 @@ async def send_turn_message(duel: DuelSession):
         duel.current_turn_msg_id = sent_msg.message_id
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение хода: {e}")
-        await bot.send_message(duel.chat_id, "⚠️ Техническая ошибка, дуэль прервана.")
+        # Попытка уведомить игроков и завершить дуэль
+        try:
+            await bot.send_message(duel.chat_id, "⚠️ Техническая ошибка, дуэль прервана.")
+        except:
+            pass
         await cleanup_duel(duel.duel_id)
         return
 
@@ -181,10 +198,11 @@ async def auto_skip_turn(duel: DuelSession, expected_msg_id: int):
         await send_turn_message(duel)
 
 async def cleanup_duel(duel_id: str):
+    """Корректно удаляет дуэль и освобождает игроков."""
     if duel_id not in active_duels:
         return
     duel = active_duels[duel_id]
-    duel.processing = True
+    duel.processing = True  # предотвращаем новые действия
     if duel.timer_task:
         duel.timer_task.cancel()
     occupied.pop((duel.chat_id, duel.challenger_id), None)
@@ -478,7 +496,7 @@ async def process_invite(callback: CallbackQuery):
         await callback.answer("Ошибка. Попробуйте ещё раз.", show_alert=True)
 
 # --------------------------
-# Действия в дуэли (ключевой блок)
+# Действия в дуэли
 # --------------------------
 @router.callback_query(F.data.startswith("act_"))
 async def process_action(callback: CallbackQuery):
@@ -514,8 +532,8 @@ async def process_action(callback: CallbackQuery):
                     message_id=duel.current_turn_msg_id,
                     reply_markup=None
                 )
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Не удалось убрать кнопки: {e}")
 
         extra_msg = ""
         current_name = callback.from_user.full_name
@@ -524,12 +542,11 @@ async def process_action(callback: CallbackQuery):
         except:
             opponent_name = "Игрок"
 
-        # Выполняем действие
+        # Обработка выбранного действия
         if action == "shoot":
             if player.ammo <= 0:
                 await callback.answer("Нет патронов!", show_alert=True)
-                # Восстанавливаем кнопки, так как ход не завершён
-                await restore_buttons(duel, duel.current_turn_msg_id)
+                await try_restore_buttons(duel, duel.current_turn_msg_id)
                 duel.processing = False
                 return
             player.ammo -= 1
@@ -561,24 +578,24 @@ async def process_action(callback: CallbackQuery):
             duel.distance += 1
             if duel.distance > 20:
                 extra_msg = f"🏃 {current_name} отходит слишком далеко и позорно сбегает!"
-                opponent.hp = -1
+                opponent.hp = -1  # пометка поражения
             else:
                 extra_msg = f"👣 {current_name} отдаляется. Дистанция: {duel.distance}"
 
         elif action == "reload":
             if player.ammo == WEAPON["magazine"]:
                 await callback.answer("Магазин уже полон.", show_alert=True)
-                await restore_buttons(duel, duel.current_turn_msg_id)
+                await try_restore_buttons(duel, duel.current_turn_msg_id)
                 duel.processing = False
                 return
             player.ammo = WEAPON["magazine"]
             extra_msg = f"🔄 {current_name} перезаряжает оружие"
 
-        # ОТПРАВЛЯЕМ РЕЗУЛЬТАТ (если не вышло – игра продолжается без паники)
+        # Отправляем результат действия (неудача не должна ломать дуэль)
         try:
             await bot.send_message(duel.chat_id, extra_msg)
         except Exception as e:
-            logger.error(f"Не удалось отправить результат в чат {duel.chat_id}: {e}")
+            logger.error(f"Ошибка отправки результата: {e}")
 
         # Проверка завершения дуэли
         winner_id = None
@@ -610,7 +627,7 @@ async def process_action(callback: CallbackQuery):
             duel.processing = False
             return
 
-        # Передаём ход противнику
+        # Передача хода противнику
         duel.current_turn = opponent_id
         try:
             await bot.send_message(
@@ -619,7 +636,12 @@ async def process_action(callback: CallbackQuery):
             )
             await send_turn_message(duel)
         except Exception as e:
-            logger.error(f"Критическая ошибка при переходе хода: {e}")
+            logger.error(f"Критическая ошибка при передаче хода: {e}")
+            # Пытаемся уведомить и завершить дуэль
+            try:
+                await bot.send_message(duel.chat_id, "⚠️ Произошла ошибка, дуэль прервана.")
+            except:
+                pass
             await cleanup_duel(duel_id)
 
         duel.processing = False
@@ -627,19 +649,12 @@ async def process_action(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_action: {e}", exc_info=True)
         if 'duel' in locals():
+            try:
+                await bot.send_message(duel.chat_id, "⚠️ Внутренняя ошибка, дуэль прервана.")
+            except:
+                pass
             await cleanup_duel(duel.duel_id)
         await callback.answer("Внутренняя ошибка, дуэль прервана.", show_alert=True)
-
-async def restore_buttons(duel: DuelSession, msg_id: int):
-    """Восстанавливает кнопки в сообщении хода (для отмены действия)."""
-    try:
-        await bot.edit_message_reply_markup(
-            chat_id=duel.chat_id,
-            message_id=msg_id,
-            reply_markup=build_action_keyboard(duel)
-        )
-    except Exception as e:
-        logger.warning(f"Не удалось восстановить кнопки: {e}")
 
 # --------------------------
 # Запуск
