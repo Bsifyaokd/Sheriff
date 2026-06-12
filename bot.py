@@ -2,12 +2,19 @@ import asyncio
 import logging
 import random
 import uuid
+import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Optional, Dict
 
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command, CommandObject
+from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ChatMemberUpdated,
+)
+from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # --------------------------
@@ -20,9 +27,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------------
-# Токен бота
+# Токен бота (из переменной окружения)
 # --------------------------
-TOKEN = "СЮДА_ТОКЕН"  # замените на реальный токен
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Переменная окружения BOT_TOKEN не установлена")
 
 # --------------------------
 # Оружейная константа
@@ -59,7 +68,7 @@ class DuelSession:
         return self.challenger_id if user_id == self.target_id else self.target_id
 
 active_duels: Dict[str, DuelSession] = {}
-occupied: Dict[(int, int), str] = {}
+occupied: dict[tuple[int, int], str] = {}  # исправленная аннотация
 
 # --------------------------
 # Инициализация бота
@@ -122,7 +131,7 @@ def build_action_keyboard(duel: DuelSession) -> InlineKeyboardMarkup:
 # Приветствие при добавлении в группу
 # --------------------------
 @router.my_chat_member()
-async def on_my_chat_member(update: types.ChatMemberUpdated):
+async def on_my_chat_member(update: ChatMemberUpdated):
     if update.new_chat_member.status == "member" and update.chat.type != "private":
         await bot.send_message(
             update.chat.id,
@@ -189,7 +198,6 @@ async def duel_command(message: Message):
             await message.reply("Один из участников уже участвует в другой дуэли.")
             return
 
-        # Короткий уникальный ID дуэли
         duel_id = uuid.uuid4().hex[:12]
         duel = DuelSession(
             duel_id=duel_id,
@@ -398,7 +406,6 @@ async def cleanup_duel(duel_id: str):
 # Запуск
 # --------------------------
 async def main():
-    from aiogram.types import ChatMemberUpdated  # импорт для my_chat_member (не забыть)
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Бот запущен")
